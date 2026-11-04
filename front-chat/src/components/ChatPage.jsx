@@ -3,7 +3,7 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import { MdAttachFile, MdSend } from "react-icons/md";
 import { useNavigate } from "react-router";
 import SockJS from "sockjs-client";
-import { Stomp } from "@stomp/stompjs";
+import { Client } from "@stomp/stompjs";
 import toast from "react-hot-toast";
 
 import useChatContext from "../context/ChatContext";
@@ -32,9 +32,30 @@ const ChatPage = () => {
   const chatBoxRef = useRef(null);
   const fileInputRef = useRef(null);
   const clientRef = useRef(null);
-  const sendingRef = useRef(false);
 
   const apiBase = baseURL.replace(/\/$/, "");
+
+  // Get attachment URL and add a missing file extension if required.
+  const getAttachmentUrl = (message) => {
+    const url = message.attachmentUrl;
+
+    if (!url) return "";
+
+    const fileExtension =
+      message.attachmentName?.match(/\.[^/.]+$/)?.[0];
+
+    if (!fileExtension) {
+      return `${apiBase}${url}`;
+    }
+
+    const lastPart = url.split("/").pop();
+
+    if (lastPart?.includes(".")) {
+      return `${apiBase}${url}`;
+    }
+
+    return `${apiBase}${url}${fileExtension}`;
+  };
 
   // Redirect when the user is not connected to a room.
   useEffect(() => {
@@ -58,7 +79,10 @@ const ChatPage = () => {
         }
       } catch (error) {
         console.error("Could not load message history:", error);
-        if (active) toast.error("Could not load chat history");
+
+        if (active) {
+          toast.error("Could not load chat history");
+        }
       }
     }
 
@@ -79,65 +103,80 @@ const ChatPage = () => {
     }
   }, [messages]);
 
-  // Connect to the room's WebSocket.
+  // Connect to the room's WebSocket using STOMP 7.
   useEffect(() => {
     if (!connected || !roomId) return;
 
     let active = true;
     let subscription = null;
 
-    const socket = new SockJS(`${apiBase}/chat`);
-    const client = Stomp.over(socket);
+    const client = new Client({
+      webSocketFactory: () => new SockJS(`${apiBase}/chat`),
+
+      // Automatically reconnect after connection loss.
+      reconnectDelay: 5000,
+
+      // Disable STOMP debug logs.
+      debug: () => {},
+    });
 
     clientRef.current = client;
-    client.debug = () => {};
 
-    client.connect(
-      {},
-      () => {
-        if (!active) {
-          client.disconnect();
-          return;
-        }
+    // Called whenever the STOMP connection is established.
+    client.onConnect = () => {
+      if (!active) return;
 
-        toast.success("Chat connected");
+      console.log("WebSocket connected successfully");
 
-        subscription = client.subscribe(
-          `/topic/room/${roomId}`,
-          (frame) => {
-            if (!active) return;
+      toast.success("Chat connected");
 
-            try {
-              const receivedMessage = JSON.parse(frame.body);
+      subscription = client.subscribe(
+        `/topic/room/${roomId}`,
+        (frame) => {
+          if (!active) return;
 
-              setMessages((previous) => {
-                // Prevent duplicates if the backend supplies a stable ID.
-                if (receivedMessage.id != null) {
-                  const exists = previous.some(
-                    (item) => item.id === receivedMessage.id
-                  );
-                  if (exists) return previous;
-                }
+          try {
+            const receivedMessage = JSON.parse(frame.body);
 
-                return [...previous, receivedMessage];
-              });
-            } catch (error) {
-              console.error("Invalid message received:", error);
-            }
+            setMessages((previous) => {
+              // Prevent duplicates if the backend supplies a stable ID.
+              if (receivedMessage.id != null) {
+                const exists = previous.some(
+                  (item) => item.id === receivedMessage.id
+                );
+
+                if (exists) return previous;
+              }
+
+              return [...previous, receivedMessage];
+            });
+          } catch (error) {
+            console.error("Invalid message received:", error);
           }
-        );
-      },
-      
-    (error) => {
-     console.error("WebSocket connection failed:", error);
-     if (active) {
-        toast.error(
-        "WebSocket failed. Check Console and backend logs."
-    );
-  }
-}
-    );
+        }
+      );
+    };
 
+    // Handle STOMP errors.
+    client.onStompError = (frame) => {
+      console.error("STOMP error:", frame.headers, frame.body);
+      toast.error("Chat connection error");
+    };
+
+    // Handle WebSocket errors.
+    client.onWebSocketError = (error) => {
+      console.error("WebSocket error:", error);
+    };
+
+    // Handle WebSocket disconnection.
+    client.onWebSocketClose = (event) => {
+      console.error("WebSocket closed:", event);
+    };
+
+    // Start the connection.
+    client.activate();
+
+    // Cleanup when leaving the room or unmounting.
     return () => {
       active = false;
 
@@ -145,11 +184,7 @@ const ChatPage = () => {
         subscription.unsubscribe();
       }
 
-      if (client.connected) {
-        client.disconnect();
-      } else {
-        socket.close();
-      }
+      client.deactivate();
 
       if (clientRef.current === client) {
         clientRef.current = null;
@@ -166,15 +201,14 @@ const ChatPage = () => {
         throw new Error("Chat is not connected");
       }
 
-      client.send(
-        `/app/sendMessage/${roomId}`,
-        {},
-        JSON.stringify({
+      client.publish({
+        destination: `/app/sendMessage/${roomId}`,
+        body: JSON.stringify({
           ...message,
           sender: currentUser,
           roomId,
-        })
-      );
+        }),
+      });
     },
     [currentUser, roomId]
   );
@@ -183,7 +217,7 @@ const ChatPage = () => {
   const sendMessage = useCallback(() => {
     const content = input.trim();
 
-    if (!content || !connected || !roomId || sendingRef.current) {
+    if (!content || !connected || !roomId) {
       return;
     }
 
@@ -206,6 +240,7 @@ const ChatPage = () => {
     }
 
     setIsUploading(true);
+
     const toastId = "file-upload";
 
     try {
@@ -238,6 +273,7 @@ const ChatPage = () => {
       toast.success("File shared successfully", { id: toastId });
     } catch (error) {
       console.error("Attachment upload failed:", error);
+
       toast.error(error.message || "File upload failed", {
         id: toastId,
       });
@@ -250,14 +286,16 @@ const ChatPage = () => {
   const handleLogout = () => {
     const client = clientRef.current;
 
-    if (client?.connected) {
-      client.disconnect();
+    if (client) {
+      client.deactivate();
     }
 
     clientRef.current = null;
+
     setConnected(false);
     setRoomId("");
     setCurrentUser("");
+
     navigate("/");
   };
 
@@ -317,16 +355,20 @@ const ChatPage = () => {
                   </div>
 
                   <div className="flex min-w-0 flex-col gap-1">
-                    <p className="text-sm font-bold">{message.sender}</p>
+                    <p className="text-sm font-bold">
+                      {message.sender}
+                    </p>
 
                     {message.content && (
-                      <p className="break-words">{message.content}</p>
+                      <p className="break-words">
+                        {message.content}
+                      </p>
                     )}
 
                     {/* Attachment link */}
                     {message.attachmentUrl && (
                       <a
-                        href={`${apiBase}${message.attachmentUrl}`}
+                        href={getAttachmentUrl(message)}
                         target="_blank"
                         rel="noreferrer"
                         className="text-blue-300 underline break-all"
